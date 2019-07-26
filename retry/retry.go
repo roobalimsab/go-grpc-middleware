@@ -6,6 +6,7 @@ package grpc_retry
 import (
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -30,19 +31,24 @@ func UnaryClientInterceptor(optFuncs ...CallOption) grpc.UnaryClientInterceptor 
 	return func(parentCtx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		grpcOpts, retryOpts := filterCallOptions(opts)
 		callOpts := reuseOrNewWithCallOptions(intOpts, retryOpts)
+		log.Printf("Callopts: %v\n", callOpts)
 		// short circuit for simplicity, and avoiding allocations.
 		if callOpts.max == 0 {
+			log.Println("Executing only once as max is 0")
 			return invoker(parentCtx, method, req, reply, cc, grpcOpts...)
 		}
 		var lastErr error
 		for attempt := uint(0); attempt < callOpts.max; attempt++ {
 			if err := waitRetryBackoff(attempt, parentCtx, callOpts); err != nil {
+				log.Printf("Error while executing waitRetryBackoff: %v\n", err.Error())
 				return err
 			}
 			callCtx := perCallContext(parentCtx, callOpts, attempt)
 			lastErr = invoker(callCtx, method, req, reply, cc, grpcOpts...)
+			log.Printf("LastErr Response from invoker: %v\n", lastErr)
 			// TODO(mwitkow): Maybe dial and transport errors should be retriable?
 			if lastErr == nil {
+				log.Println("Returning due to no err")
 				return nil
 			}
 			logTrace(parentCtx, "grpc_retry attempt: %d, got err: %v", attempt, lastErr)
@@ -50,17 +56,21 @@ func UnaryClientInterceptor(optFuncs ...CallOption) grpc.UnaryClientInterceptor 
 				if parentCtx.Err() != nil {
 					logTrace(parentCtx, "grpc_retry attempt: %d, parent context error: %v", attempt, parentCtx.Err())
 					// its the parent context deadline or cancellation.
+					log.Printf("Returning due to parent context deadline exceeded err - %v\n", parentCtx.Err().Error())
 					return lastErr
 				} else {
 					logTrace(parentCtx, "grpc_retry attempt: %d, context error from retry call", attempt)
 					// its the callCtx deadline or cancellation, in which case try again.
+					log.Printf("Continuing due to call context err - %v\n", lastErr.Error())
 					continue
 				}
 			}
 			if !isRetriable(lastErr, callOpts) {
+				log.Printf("Returning due to not retriable - %v\n", lastErr)
 				return lastErr
 			}
 		}
+		log.Printf("Returning at last - %v\n", lastErr)
 		return lastErr
 	}
 }
@@ -273,13 +283,16 @@ func isRetriable(err error, callOpts *options) bool {
 	errCode := grpc.Code(err)
 	if isContextError(err) {
 		// context errors are not retriable based on user settings.
+		log.Printf("not retriable due to context error %v - %v \n", err.Error(), errCode)
 		return false
 	}
 	for _, code := range callOpts.codes {
 		if code == errCode {
+			log.Printf("Retriable due to error code %v \n", errCode)
 			return true
 		}
 	}
+	log.Printf("Not retriable not present in given retriable codes %v \n", err.Error())
 	return false
 }
 
